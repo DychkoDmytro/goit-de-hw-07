@@ -1,0 +1,137 @@
+from datetime import datetime, timedelta
+import random
+import time
+
+from airflow import DAG
+from airflow.operators.python import PythonOperator, BranchPythonOperator
+from airflow.providers.mysql.operators.mysql import MySqlOperator
+from airflow.providers.mysql.hooks.mysql import MySqlHook
+from airflow.sensors.sql import SqlSensor
+from airflow.utils.trigger_rule import TriggerRule
+
+
+default_args = {
+    "owner": "airflow",
+    "retries": 1,
+    "retry_delay": timedelta(minutes=1),
+}
+
+with DAG(
+    dag_id="olympic_medals_lesson_dag",
+    default_args=default_args,
+    start_date=datetime(2025, 1, 1),
+    schedule_interval=None,
+    catchup=False,
+    tags=["olympic", "medals", "lesson"],
+) as dag:
+
+    # 1. Создаём таблицу для статистики медалей
+    create_table = MySqlOperator(
+        task_id="create_medal_stats_table",
+        mysql_conn_id="mysql_default",
+        sql="""
+        CREATE TABLE IF NOT EXISTS olympic_dataset.medal_stats (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            medal_type VARCHAR(10),
+            count INT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        """,
+    )
+
+    # 2. Случайно выбираем тип медали
+    def choose_medal(**kwargs):
+        medal = random.choice(["Bronze", "Silver", "Gold"])
+        kwargs["ti"].xcom_push(key="chosen_medal", value=medal)
+        return medal
+
+    choose_medal_task = PythonOperator(
+        task_id="choose_medal",
+        python_callable=choose_medal,
+    )
+
+    # 3. Ветвление по выбранной медали
+    def branch_by_medal(**kwargs):
+        ti = kwargs["ti"]
+        medal = ti.xcom_pull(task_ids="choose_medal", key="chosen_medal")
+        if medal == "Bronze":
+            return "process_bronze"
+        elif medal == "Silver":
+            return "process_silver"
+        else:
+            return "process_gold"
+
+    branch_task = BranchPythonOperator(
+        task_id="branch_by_medal",
+        python_callable=branch_by_medal,
+    )
+
+    # 4. Функция: посчитать медали и записать результат в таблицу
+    def count_and_insert_medal(medal_type: str):
+        hook = MySqlHook(mysql_conn_id="mysql_default")
+        conn = hook.get_conn()
+        cursor = conn.cursor()
+
+        count_sql = """
+            SELECT COUNT(*)
+            FROM olympic_dataset.athlete_event_results
+            WHERE medal = %s;
+        """
+        cursor.execute(count_sql, (medal_type,))
+        (medal_count,) = cursor.fetchone()
+
+        insert_sql = """
+            INSERT INTO olympic_dataset.medal_stats (medal_type, count, created_at)
+            VALUES (%s, %s, NOW());
+        """
+        cursor.execute(insert_sql, (medal_type, medal_count))
+        conn.commit()
+
+        cursor.close()
+        conn.close()
+
+    process_bronze = PythonOperator(
+        task_id="process_bronze",
+        python_callable=count_and_insert_medal,
+        op_kwargs={"medal_type": "Bronze"},
+    )
+
+    process_silver = PythonOperator(
+        task_id="process_silver",
+        python_callable=count_and_insert_medal,
+        op_kwargs={"medal_type": "Silver"},
+    )
+
+    process_gold = PythonOperator(
+        task_id="process_gold",
+        python_callable=count_and_insert_medal,
+        op_kwargs={"medal_type": "Gold"},
+    )
+
+    # 5. Задержка перед сенсором — УСПЕШНЫЙ вариант (10 секунд)
+    def wait_before_sensor():
+        time.sleep(10)
+
+    delay_task = PythonOperator(
+        task_id="delay_before_sensor",
+        python_callable=wait_before_sensor,
+        trigger_rule=TriggerRule.ONE_SUCCESS,
+    )
+
+    # 6. SqlSensor: проверяет, что последняя запись не старше 30 секунд
+    check_latest_record_fresh = SqlSensor(
+        task_id="check_latest_record_fresh",
+        conn_id="mysql_default",
+        sql="""
+            SELECT
+              MAX(created_at) >= (NOW() - INTERVAL 30 SECOND)
+            FROM olympic_dataset.medal_stats;
+        """,
+        poke_interval=10,
+        timeout=60,
+        mode="poke",
+    )
+
+    create_table >> choose_medal_task >> branch_task
+    branch_task >> [process_bronze, process_silver, process_gold]
+    [process_bronze, process_silver, process_gold] >> delay_task >> check_latest_record_fresh
