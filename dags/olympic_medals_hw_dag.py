@@ -1,16 +1,11 @@
 from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.python import PythonOperator, BranchPythonOperator
+from airflow.providers.postgres.operators.postgres import PostgresOperator
+from airflow.sensors.sql import SqlSensor
 import random
 import time
 
-from airflow import DAG
-from airflow.operators.python import PythonOperator, BranchPythonOperator
-from airflow.providers.mysql.operators.mysql import MySqlOperator
-from airflow.providers.mysql.hooks.mysql import MySqlHook
-from airflow.sensors.sql import SqlSensor
-from airflow.utils.trigger_rule import TriggerRule
-
-# ВАЖНО: проверь, что в Airflow есть соединение с таким conn_id
-MYSQL_CONN_ID = "mysql_default"
 
 default_args = {
     "owner": "airflow",
@@ -24,115 +19,114 @@ with DAG(
     start_date=datetime(2025, 1, 1),
     schedule_interval=None,
     catchup=False,
-    tags=["olympic", "homework", "medals"],
+    tags=["homework", "olympic", "medals"],
 ) as dag:
 
-    # 1. Создаём таблицу для статистики медалей
-    create_table = MySqlOperator(
+    # ---------------------------------------------------------
+    # TASK 1: Создание таблицы Postgres (вместо MySQL)
+    # ---------------------------------------------------------
+    create_medals_stats_table = PostgresOperator(
         task_id="create_medals_stats_table",
-        mysql_conn_id=MYSQL_CONN_ID,
+        postgres_conn_id="hw_postgres",
         sql="""
-        CREATE TABLE IF NOT EXISTS olympic_dataset.medal_stats (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            medal_type VARCHAR(10),
-            count INT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        );
+            CREATE TABLE IF NOT EXISTS medals_stats (
+                id SERIAL PRIMARY KEY,
+                medal_type VARCHAR(50),
+                value INT,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
         """,
     )
 
-    # 2. Випадковий вибір ['Bronze', 'Silver', 'Gold']
-    def choose_medal_type(**context):
-        medal = random.choice(["Bronze", "Silver", "Gold"])
-        # кладём в XCom
+    # ---------------------------------------------------------
+    # TASK 2: Выбор случайной медали
+    # ---------------------------------------------------------
+    def choose_medal_func(**context):
+        medal = random.choice(["gold", "silver", "bronze"])
+        print(f"Chosen medal: {medal}")
         return medal
 
     choose_medal = PythonOperator(
         task_id="choose_medal",
-        python_callable=choose_medal_type,
+        python_callable=choose_medal_func,
     )
 
-    # 3. Branch — в зависимости от выбранной медали
-    def branch_by_medal(**context):
-        medal = context["ti"].xcom_pull(task_ids="choose_medal")
-        if medal == "Bronze":
-            return "process_bronze"
-        elif medal == "Silver":
-            return "process_silver"
-        else:
-            return "process_gold"
+    # ---------------------------------------------------------
+    # TASK 3: Ветка по медали
+    # ---------------------------------------------------------
+    def branch_by_medal_func(**context):
+        ti = context["ti"]
+        medal = ti.xcom_pull(task_ids="choose_medal")
+        print("Branching for:", medal)
+        return f"process_{medal}"
 
-    branch_task = BranchPythonOperator(
+    branch_by_medal = BranchPythonOperator(
         task_id="branch_by_medal",
-        python_callable=branch_by_medal,
-        provide_context=True,
+        python_callable=branch_by_medal_func,
     )
 
-    # 4. Три задачи — считаем количество и пишем в таблицу
+    # ---------------------------------------------------------
+    # TASK 4: Обработка медалей
+    # ---------------------------------------------------------
+    def process_gold_func():
+        print("Processing GOLD medal...")
+        time.sleep(1)
 
-    def insert_medal_count(medal_type: str):
-        hook = MySqlHook(mysql_conn_id=MYSQL_CONN_ID)
-        count_sql = """
-            SELECT COUNT(*) AS cnt
-            FROM olympic_dataset.athlete_event_results
-            WHERE medal = %s;
-        """
-        records = hook.get_first(count_sql, parameters=(medal_type,))
-        cnt = records[0] if records else 0
+    def process_silver_func():
+        print("Processing SILVER medal...")
+        time.sleep(1)
 
-        insert_sql = """
-            INSERT INTO olympic_dataset.medal_stats (medal_type, count, created_at)
-            VALUES (%s, %s, NOW());
-        """
-        hook.run(insert_sql, parameters=(medal_type, cnt))
+    def process_bronze_func():
+        print("Processing BRONZE medal...")
+        time.sleep(1)
 
-    def make_medal_task(task_id: str, medal_type: str):
-        return PythonOperator(
-            task_id=task_id,
-            python_callable=insert_medal_count,
-            op_kwargs={"medal_type": medal_type},
-        )
+    process_gold = PythonOperator(
+        task_id="process_gold",
+        python_callable=process_gold_func,
+    )
 
-    process_bronze = make_medal_task("process_bronze", "Bronze")
-    process_silver = make_medal_task("process_silver", "Silver")
-    process_gold = make_medal_task("process_gold", "Gold")
+    process_silver = PythonOperator(
+        task_id="process_silver",
+        python_callable=process_silver_func,
+    )
 
-    # 5. Задержка
-    # Вариант 1: сделай тут 20 сек, чтобы сенсор прошёл
-    # Вариант 2: временно меняешь на 35 сек и показываешь, что сенсор падает
-    def delay_task_fn(delay_seconds: int = 20):
-        time.sleep(delay_seconds)
+    process_bronze = PythonOperator(
+        task_id="process_bronze",
+        python_callable=process_bronze_func,
+    )
 
-    delay_task = PythonOperator(
+    # ---------------------------------------------------------
+    # TASK 5: Искусственная задержка перед проверкой
+    # ---------------------------------------------------------
+    def delay_after_insert_func():
+        print("Delaying after insert...")
+        time.sleep(5)
+
+    delay_after_insert = PythonOperator(
         task_id="delay_after_insert",
-        python_callable=delay_task_fn,
-        op_kwargs={"delay_seconds": 20},  # меняй на 35 для failed-скрина
-        trigger_rule=TriggerRule.ONE_SUCCESS,  # достаточно успеха одного из трёх
+        python_callable=delay_after_insert_func,
     )
 
-    # 6. Сенсор: самый новый запис не старше 30 сек
-    medal_sensor = SqlSensor(
+    # ---------------------------------------------------------
+    # TASK 6: SQL Sensor. Проверка, что запись свежая
+    # ---------------------------------------------------------
+    check_latest_medal_record_is_fresh = SqlSensor(
         task_id="check_latest_medal_record_is_fresh",
-        conn_id=MYSQL_CONN_ID,
+        conn_id="hw_postgres",
         sql="""
-        SELECT
-            CASE
-                WHEN TIMESTAMPDIFF(
-                    SECOND,
-                    MAX(created_at),
-                    NOW()
-                ) <= 30
-                THEN 1
-                ELSE 0
-            END AS is_fresh
-        FROM olympic_dataset.medal_stats;
+            SELECT 1
+            FROM medals_stats
+            WHERE created_at > NOW() - INTERVAL '10 minutes';
         """,
-        mode="poke",           # можно оставить по умолчанию
-        poke_interval=10,      # каждые 10 сек проверка
-        timeout=60,            # общее время ожидания
+        poke_interval=5,
+        timeout=60,
+        mode="poke",
     )
 
-    # Зависимости
-    create_table >> choose_medal >> branch_task
-    branch_task >> [process_bronze, process_silver, process_gold] >> delay_task
-    delay_task >> medal_sensor
+    # -------------------- DAG dependencies ---------------------
+
+    create_medals_stats_table >> choose_medal >> branch_by_medal
+    branch_by_medal >> process_gold >> delay_after_insert
+    branch_by_medal >> process_silver >> delay_after_insert
+    branch_by_medal >> process_bronze >> delay_after_insert
+    delay_after_insert >> check_latest_medal_record_is_fresh
